@@ -19,7 +19,7 @@ import torch
 from diffusers import Flux3Transformer2DModel
 from diffusers.utils.torch_utils import randn_tensor
 
-from ...testing_utils import enable_full_determinism, torch_device
+from ...testing_utils import enable_full_determinism, require_torch_gpu, torch_device
 from ..testing_utils import (
     AttentionTesterMixin,
     BaseModelTesterConfig,
@@ -98,6 +98,48 @@ class Flux3TransformerTesterConfig(BaseModelTesterConfig):
 
 
 class TestFlux3TransformerModel(Flux3TransformerTesterConfig, ModelTesterMixin):
+    @require_torch_gpu
+    @torch.inference_mode()
+    def test_fp16_context_projection_overflow(self):
+        torch.manual_seed(0)
+        model = self.model_class(**self.get_init_dict()).to(device="cuda", dtype=torch.float16).eval()
+        inputs = {
+            name: tensor.to(device="cuda", dtype=torch.float16) for name, tensor in self.get_dummy_inputs().items()
+        }
+        inputs["encoder_hidden_states"].fill_(64)
+        model.context_embedder.weight.fill_(64)
+
+        projected = model.context_embedder(inputs["encoder_hidden_states"])
+        assert projected.dtype == torch.float32
+        assert (projected == 131072).all()
+        assert torch.isfinite(model(**inputs).sample).all()
+
+    @require_torch_gpu
+    @torch.inference_mode()
+    def test_fp16_feed_forward_projection_overflow(self):
+        model = self.model_class(**self.get_init_dict()).to(device="cuda", dtype=torch.float16).eval()
+        ff = model.txt_mode_blocks[0].ff
+        ff.linear_in.weight.fill_(1)
+        ff.linear_out.weight.fill_(1)
+        hidden_states = torch.ones((1, 2, ff.linear_in.in_features), device="cuda", dtype=torch.float16)
+
+        projected = ff(hidden_states)
+        assert projected.dtype == torch.float32
+        assert torch.isfinite(projected).all()
+        assert (projected > torch.finfo(torch.float16).max).all()
+
+    @require_torch_gpu
+    def test_fp16_projection_reentrant_checkpointing(self):
+        model = self.model_class(**self.get_init_dict()).to(device="cuda", dtype=torch.float16)
+        hidden_states = torch.ones(
+            (1, 2, model.context_embedder.in_features), device="cuda", dtype=torch.float16, requires_grad=True
+        )
+
+        output = torch.utils.checkpoint.checkpoint(model.context_embedder, hidden_states, use_reentrant=True)
+        assert output.dtype == torch.float16
+        output.sum().backward()
+        assert torch.isfinite(hidden_states.grad).all()
+
     @torch.no_grad()
     def test_image_cond_inputs(self):
         torch.manual_seed(0)

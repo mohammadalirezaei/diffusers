@@ -20,7 +20,7 @@ import torch.nn.functional as F
 
 from ...configuration_utils import ConfigMixin, register_to_config
 from ...loaders import FromOriginalModelMixin, PeftAdapterMixin
-from ...utils import apply_lora_scale, logging
+from ...utils import apply_lora_scale, is_torch_version, logging
 from ...utils.torch_utils import maybe_adjust_dtype_for_device
 from ..attention import AttentionMixin, AttentionModuleMixin
 from ..attention_dispatch import dispatch_attention_fn
@@ -30,6 +30,33 @@ from ..modeling_utils import ModelMixin
 
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
+_HAS_MM_OUT_DTYPE = is_torch_version(">=", "2.8")
+
+
+class _Flux3Linear(nn.Linear):
+    """Keep the output of an overflow-prone FP16 projection in FP32 during CUDA inference."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if (
+            not x.is_cuda
+            or self.weight.dtype != torch.float16
+            or type(self.weight) is not nn.Parameter
+            or self.training
+            or torch.is_grad_enabled()
+            or (torch.is_autocast_enabled("cuda") and torch.get_autocast_dtype("cuda") != torch.float16)
+        ):
+            return super().forward(x)
+
+        # Upcasting the output of a standard FP16 linear is too late once it contains infinities.
+        with torch.autocast("cuda", enabled=False):
+            bias = self.bias.float() if self.bias is not None else None
+            if not _HAS_MM_OUT_DTYPE:
+                return F.linear(x.float(), self.weight.float(), bias)
+
+            output = torch.mm(x.half().reshape(-1, self.in_features), self.weight.T, out_dtype=torch.float32)
+            if bias is not None:
+                output = output + bias
+            return output.reshape(*x.shape[:-1], self.out_features)
 
 
 # Copied from diffusers.models.transformers.transformer_flux2.Flux2SwiGLU with Flux2->Flux3
@@ -49,7 +76,6 @@ class Flux3SwiGLU(nn.Module):
         return x
 
 
-# Copied from diffusers.models.transformers.transformer_flux2.Flux2FeedForward with Flux2->Flux3
 class Flux3FeedForward(nn.Module):
     def __init__(
         self,
@@ -67,7 +93,7 @@ class Flux3FeedForward(nn.Module):
         # Flux3SwiGLU will reduce the dimension by half
         self.linear_in = nn.Linear(dim, inner_dim * 2, bias=bias)
         self.act_fn = Flux3SwiGLU()
-        self.linear_out = nn.Linear(inner_dim, dim_out, bias=bias)
+        self.linear_out = _Flux3Linear(inner_dim, dim_out, bias=bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.linear_in(x)
@@ -227,6 +253,8 @@ class Flux3ModeTransformerBlock(nn.Module):
 
         norm_hidden_states = self.norm(hidden_states)
         norm_hidden_states = (1 + mod_scale) * norm_hidden_states + mod_shift
+        if temb_mod.dtype == torch.float16:
+            norm_hidden_states = norm_hidden_states.half()
 
         attn_output = self.attn(hidden_states=norm_hidden_states, image_rotary_emb=image_rotary_emb)
         ff_output = self.ff(norm_hidden_states)
@@ -278,6 +306,8 @@ class Flux3SingleTransformerBlock(nn.Module):
         norm_encoder_hidden_states = (1 + c_mod_scale) * norm_encoder_hidden_states + c_mod_shift
 
         combined = torch.cat([norm_encoder_hidden_states, norm_hidden_states], dim=1)
+        if temb_mod.dtype == torch.float16:
+            combined = combined.half()
 
         attn_output = self.attn(hidden_states=combined, image_rotary_emb=image_rotary_emb)
         ff_output = self.ff(combined)
@@ -438,7 +468,7 @@ class Flux3Transformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOri
         self.x_embedders = nn.ModuleDict(
             {name: nn.Linear(channels, self.inner_dim, bias=False) for name, channels in in_channels_per_mode.items()}
         )
-        self.context_embedder = nn.Linear(joint_attention_dim, self.inner_dim, bias=False)
+        self.context_embedder = _Flux3Linear(joint_attention_dim, self.inner_dim, bias=False)
 
         # 5. Per-mode transformer blocks
         self.mode_blocks = nn.ModuleDict(
@@ -648,6 +678,8 @@ class Flux3Transformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOri
         # 7. Output layers: the image tokens sit first in the content sequence; the reference tokens produce no output
         hidden_states = content_states[:, :image_seq_len]
         hidden_states = self.norm_out(hidden_states, image_temb)
+        if image_temb.dtype == torch.float16:
+            hidden_states = hidden_states.half()
         output = self.proj_out(hidden_states)
 
         if not return_dict:
